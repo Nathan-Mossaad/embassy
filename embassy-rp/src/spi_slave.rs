@@ -32,7 +32,7 @@ const DMA_MAX_COUNT: usize = {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
-    /// RX FIFO overflowed and bytes were lost during a blocking transfer.
+    /// RX FIFO overflowed while requested data was still being received.
     ReceiveOverrun,
     /// Buffer exceeds the DMA count limit.
     BufferTooLong,
@@ -441,7 +441,13 @@ impl<'d> Spi<'d, Async> {
     /// the FIFO when CS rises. It does not report how many bytes reached the wire.
     /// Both counts can be full while the operation continues waiting for CS to rise.
     /// Each DMA buffer is limited to `0x0fff_ffff` bytes.
-    /// RX FIFO overrun is ignored; TX data after the buffer ends is unspecified.
+    /// RX FIFO overrun observed while RX DMA is incomplete returns `ReceiveOverrun`.
+    /// Overrun after RX fills is ignored. The hardware does not timestamp overruns:
+    /// if RX DMA completes before software observes an overrun, earlier data loss
+    /// cannot be distinguished from expected overflow after the buffer filled.
+    /// TX data after the buffer ends is unspecified.
+    /// DMA bus errors are handled by the DMA interrupt handler, as in the master driver.
+    /// Errors may abort before CS rises; the master must finish that assertion before rearming.
     /// All buffers stay borrowed until DMA has stopped.
     pub async fn transfer(&mut self, rx: &mut [u8], tx: &[u8]) -> Result<(usize, usize), Error> {
         // Reject buffers whose lengths cannot be represented by DMA.
@@ -477,35 +483,50 @@ impl<'d> Spi<'d, Async> {
             Self::prepare_dma(channels);
             let mut cs_end = core::pin::pin!(cs_end);
 
-            // SAFETY: Channels are owned and idle, and buffer lengths were checked above.
-            // The cleanup guard stops DMA before any buffer borrow is released.
-            unsafe { Self::configure_transfer_dma(info, tx_dma, rx_dma, rx, tx) };
-
-            // Publish buffer contents before any DMA channel starts.
-            compiler_fence(Ordering::SeqCst);
-
-            // Start only nonempty buffers. No DMA runs after a buffer is exhausted.
-            if !rx.is_empty() {
-                pac::DMA
-                    .multi_chan_trigger()
-                    .write(|w| w.set_multi_chan_trigger(1 << rx_dma));
-            }
+            // SAFETY: Buffers stay borrowed until both Transfer objects are dropped
+            // and stop_dma has retired pending writes. RX is armed before SPI starts.
+            let mut rx_transfer = if rx.is_empty() {
+                None
+            } else {
+                Some(unsafe {
+                    self.rx_dma.as_mut().unwrap().read(
+                        info.regs.dr().as_ptr() as *const u8,
+                        rx as *mut [u8],
+                        info.rx_dreq,
+                        false,
+                    )
+                })
+            };
 
             info.regs.cr1().modify(|w| w.set_sse(true));
 
-            if !tx.is_empty() {
-                pac::DMA
-                    .multi_chan_trigger()
-                    .write(|w| w.set_multi_chan_trigger(1 << tx_dma));
-            }
+            // SAFETY: TX remains borrowed through DMA shutdown, as for RX above.
+            let mut tx_transfer = if tx.is_empty() {
+                None
+            } else {
+                Some(unsafe {
+                    self.tx_dma.as_mut().unwrap().write(
+                        tx as *const [u8],
+                        info.regs.dr().as_ptr() as *mut u8,
+                        info.tx_dreq,
+                        false,
+                    )
+                })
+            };
+            // Declared after the transfers so SPI stops before their abort-on-drop
+            // cleanup, including on cancellation and early errors.
+            let stop_spi = OnDrop::new(|| info.regs.cr1().modify(|w| w.set_sse(false)));
+            let mut rx_done = rx_transfer.is_none();
+            let mut tx_done = tx_transfer.is_none();
 
             // Keep preload cancellable and register the CS waker during setup.
             poll_fn(|cx| {
                 // Observe preload first, then validate CS so activity during this poll
                 // cannot be accepted just because the FIFO became full afterward.
-                let preloaded = tx.is_empty()
-                    || !info.regs.sr().read().tnf()
-                    || !pac::DMA.ch(tx_dma as _).ctrl_trig().read().busy();
+                if let Some(transfer) = tx_transfer.as_mut() {
+                    tx_done = core::pin::Pin::new(transfer).poll(cx).is_ready();
+                }
+                let preloaded = tx_done || !info.regs.sr().read().tnf();
 
                 // Reject a transaction that starts before preload is complete.
                 if cs_end.as_mut().poll(cx).is_ready()
@@ -515,27 +536,43 @@ impl<'d> Spi<'d, Async> {
                     return Poll::Ready(Err(Error::NotReady));
                 }
 
-                // Reject DMA bus errors during preload.
-                if channels
-                    .iter()
-                    .any(|&channel| pac::DMA.ch(channel as _).ctrl_trig().read().ahb_error())
-                {
-                    return Poll::Ready(Err(Error::DmaError));
-                }
-
                 // Ready when TX is empty, the FIFO is full, or all TX bytes are queued.
                 if preloaded {
                     return Poll::Ready(Ok(()));
                 }
 
-                // DMA IRQs are masked, so poll again while preload is in progress.
+                // FIFO-full has no DMA completion IRQ; poll until preload is ready.
                 cx.waker().wake_by_ref();
                 Poll::Pending
             })
             .await?;
 
-            // Wait for CS to rise before stopping SPI and DMA.
-            cs_end.as_mut().await;
+            // DMA completion wakes this future to check RX overrun. Full buffers
+            // do not end the transaction: only CS rising does that.
+            poll_fn(|cx| {
+                if !rx_done {
+                    // Sample overrun before completion: observing RX still busy
+                    // proves that the overflow happened before the buffer filled.
+                    let overrun = info.regs.ris().read().rorris();
+                    if let Some(transfer) = rx_transfer.as_mut() {
+                        rx_done = core::pin::Pin::new(transfer).poll(cx).is_ready();
+                    }
+                    if overrun && !rx_done {
+                        return Poll::Ready(Err(Error::ReceiveOverrun));
+                    }
+                }
+                if !tx_done {
+                    if let Some(transfer) = tx_transfer.as_mut() {
+                        tx_done = core::pin::Pin::new(transfer).poll(cx).is_ready();
+                    }
+                }
+                cs_end.as_mut().poll(cx).map(|()| Ok(()))
+            })
+            .await?;
+
+            // Stop SPI before dropping the DMA transfers, which abort unfinished DMA.
+            // On cancellation, cleanup also waits for all pending DMA writes.
+            drop(stop_spi);
         }
 
         // Stop DMA and retire pending writes before accessing RX.
@@ -543,41 +580,6 @@ impl<'d> Spi<'d, Async> {
         cleanup.defuse();
 
         self.finish_dma_transfer(rx, tx.len())
-    }
-
-    /// Configures the buffer channels without starting DMA.
-    ///
-    /// # Safety
-    /// Channels must be owned and idle, and buffer lengths must fit `DMA_MAX_COUNT`.
-    /// Buffers must remain borrowed and at stable addresses until DMA has stopped.
-    unsafe fn configure_transfer_dma(info: &Info, tx_dma: u8, rx_dma: u8, rx: &mut [u8], tx: &[u8]) {
-        // Store RX until the buffer fills, then allow the FIFO to overflow.
-        if !rx.is_empty() {
-            Self::configure_dma(
-                rx_dma,
-                info.regs.dr().as_ptr() as _,
-                rx.as_mut_ptr(),
-                rx.len(),
-                false,
-                true,
-                info.rx_dreq,
-                rx_dma,
-            );
-        }
-
-        // Send TX once, then allow the FIFO to underflow.
-        if !tx.is_empty() {
-            Self::configure_dma(
-                tx_dma,
-                tx.as_ptr(),
-                info.regs.dr().as_ptr() as _,
-                tx.len(),
-                true,
-                false,
-                info.tx_dreq,
-                tx_dma,
-            );
-        }
     }
 
     /// Stores residual RX, checks DMA errors and clears transaction state.
@@ -615,74 +617,21 @@ impl<'d> Spi<'d, Async> {
             tx_len.saturating_sub(remaining)
         };
 
+        // Check before draining: queued FIFO bytes must not hide an overrun
+        // that occurred while DMA still had room in the requested buffer.
+        if next < rx.len() && self.info.regs.ris().read().rorris() {
+            Self::disable_and_clear_fifos(self.info);
+            return Err(Error::ReceiveOverrun);
+        }
         let drained = self.drain_received(&mut rx[next..].iter_mut());
-        // Overflow is expected once RX is full. Clear it without returning an error.
+        // Overflow after RX DMA completed is expected and does not cause an error.
         Self::disable_and_clear_fifos(self.info);
         Ok(((next + drained).min(rx.len()), queued_for_tx))
     }
 
-    /// Configures a byte-wide DMA channel without triggering it.
-    ///
-    /// # Safety
-    /// The channel must be owned and idle, and `chain_to` must select an owned channel.
-    /// `len` must be nonzero and at most `DMA_MAX_COUNT`. Source and destination must
-    /// support the configured accesses and remain valid until DMA stops. DMA must have
-    /// exclusive access to destination storage, and source storage must not be modified.
-    unsafe fn configure_dma(
-        channel: u8,
-        from: *const u8,
-        to: *mut u8,
-        len: usize,
-        incr_read: bool,
-        incr_write: bool,
-        dreq: pac::dma::vals::TreqSel,
-        chain_to: u8,
-    ) {
-        let p = pac::DMA.ch(channel as _);
-
-        p.read_addr().write_value(from as u32);
-        p.write_addr().write_value(to as u32);
-
-        // Program a finite transfer count on either chip.
-        #[cfg(feature = "rp2040")]
-        p.trans_count().write_value(len as u32);
-        #[cfg(feature = "_rp235x")]
-        p.trans_count().write(|w| {
-            w.set_mode(0.into());
-            w.set_count(len as u32);
-        });
-
-        // Configure without triggering the channel.
-        p.al1_ctrl().write(|ctrl| {
-            ctrl.set_data_size(pac::dma::vals::DataSize::SizeByte);
-            ctrl.set_incr_read(incr_read);
-            ctrl.set_incr_write(incr_write);
-
-            ctrl.set_treq_sel(dreq);
-            ctrl.set_chain_to(chain_to);
-
-            // Report completion for channels that do not chain onward.
-            ctrl.set_irq_quiet(chain_to != channel);
-
-            // Clear stale bus errors and enable the channel for a later trigger.
-            ctrl.set_read_error(true);
-            ctrl.set_write_error(true);
-            ctrl.set_en(true);
-        });
-    }
-
-    /// Masks DMA interrupts and clears previous completion, error and chaining state.
+    /// Clears previous completion and error state without masking DMA interrupts.
     fn prepare_dma(channels: [u8; 2]) {
         let mask = (1 << channels[0]) | (1 << channels[1]);
-
-        // Mask all owned channels; bus errors ignore IRQ_QUIET.
-        pac::DMA.inte(0).write_clear(|w| *w = mask);
-        pac::DMA.inte(1).write_clear(|w| *w = mask);
-        #[cfg(feature = "_rp235x")]
-        {
-            pac::DMA.inte(2).write_clear(|w| *w = mask);
-            pac::DMA.inte(3).write_clear(|w| *w = mask);
-        }
 
         // Clear completion flags from the previous transaction.
         pac::DMA.intr(0).write_value(mask);
