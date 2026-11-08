@@ -32,12 +32,10 @@ const DMA_MAX_COUNT: usize = {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum Error {
-    /// RX FIFO overflowed and bytes were lost.
+    /// RX FIFO overflowed and bytes were lost during a blocking transfer.
     ReceiveOverrun,
     /// Buffer exceeds the DMA count limit.
     BufferTooLong,
-    /// DMA padding or discard capacity exhausted.
-    TransactionTooLong,
     /// DMA bus error.
     DmaError,
     /// CS was low or changed before buffers were armed.
@@ -88,26 +86,15 @@ impl defmt::Format for Config {
 struct DmaChannels<'d> {
     tx: Channel<'d, Blocking>,
     rx: Channel<'d, Blocking>,
-    padding: Channel<'d, Blocking>,
-    discard: Channel<'d, Blocking>,
 }
 
 impl DmaChannels<'_> {
-    fn numbers(&self) -> [u8; 4] {
-        [
-            self.tx.number(),
-            self.rx.number(),
-            self.padding.number(),
-            self.discard.number(),
-        ]
+    fn numbers(&self) -> [u8; 2] {
+        [self.tx.number(), self.rx.number()]
     }
 
     fn mask(&self) -> u32 {
         self.numbers().iter().fold(0, |mask, &channel| mask | (1 << channel))
-    }
-
-    fn tail_mask(&self) -> u32 {
-        (1 << self.padding.number()) | (1 << self.discard.number())
     }
 
     fn has_error(&self) -> bool {
@@ -120,10 +107,12 @@ impl DmaChannels<'_> {
 /// Serial Peripheral Interface in slave mode.
 ///
 /// Operations finish when CS rises. Buffers are independent upper bounds;
-/// excess TX is zero-filled and RX discarded. Short transactions leave the unused
-/// portion of RX unchanged. Returned counts are capped at each buffer's length;
-/// padding and discarded bytes are not included. Full counts do not distinguish
-/// an exactly filled buffer from a longer transaction.
+/// blocking transfers pad TX with zeroes and discard excess RX. Async transfers
+/// stop servicing each FIFO when its buffer ends: excess RX may overflow and
+/// MISO data after TX runs out is unspecified. Short transactions leave the unused
+/// portion of RX unchanged.
+/// Async TX counts report bytes queued to the FIFO, including bytes not clocked
+/// out before CS rises; blocking TX counts report exchanged bytes.
 /// SPI is enabled during transfer setup and left disabled after completion or cancellation.
 ///
 /// Keep CS high until buffers are armed, and between operations until cleanup and
@@ -393,14 +382,8 @@ impl<'d> Spi<'d, Blocking> {
 
 impl<'d> Spi<'d, Async> {
     /// Create an SPI slave driver in async mode supporting DMA operations.
-    /// Uses four DMA channels for buffers and padding/discard tails; no DMA IRQ required.
-    pub fn new<
-        T: Instance,
-        TxDma: ChannelInstance,
-        RxDma: ChannelInstance,
-        TxTailDma: ChannelInstance,
-        RxTailDma: ChannelInstance,
-    >(
+    /// Uses two DMA channels; no DMA IRQ required.
+    pub fn new<T: Instance, TxDma: ChannelInstance, RxDma: ChannelInstance>(
         spi: Peri<'d, T>,
         clk: Peri<'d, impl ClkPin<T> + 'd>,
         mosi: Peri<'d, impl MisoPin<T> + 'd>,
@@ -408,8 +391,6 @@ impl<'d> Spi<'d, Async> {
         cs: Peri<'d, impl CsPin<T> + 'd>,
         tx_dma: Peri<'d, TxDma>,
         rx_dma: Peri<'d, RxDma>,
-        tx_tail_dma: Peri<'d, TxTailDma>,
-        rx_tail_dma: Peri<'d, RxTailDma>,
         config: Config,
     ) -> Self {
         Self::new_async_inner(
@@ -420,43 +401,22 @@ impl<'d> Spi<'d, Async> {
             cs.into(),
             tx_dma,
             rx_dma,
-            tx_tail_dma,
-            rx_tail_dma,
             config,
         )
     }
 
     /// Create an SPI slave driver in async mode supporting reads only (MOSI only).
-    /// Uses four DMA channels; no DMA IRQ required.
-    pub fn new_rxonly<
-        T: Instance,
-        TxDma: ChannelInstance,
-        RxDma: ChannelInstance,
-        TxTailDma: ChannelInstance,
-        RxTailDma: ChannelInstance,
-    >(
+    /// Uses two DMA channels; no DMA IRQ required.
+    pub fn new_rxonly<T: Instance, TxDma: ChannelInstance, RxDma: ChannelInstance>(
         spi: Peri<'d, T>,
         clk: Peri<'d, impl ClkPin<T> + 'd>,
         mosi: Peri<'d, impl MisoPin<T> + 'd>,
         cs: Peri<'d, impl CsPin<T> + 'd>,
         tx_dma: Peri<'d, TxDma>,
         rx_dma: Peri<'d, RxDma>,
-        tx_tail_dma: Peri<'d, TxTailDma>,
-        rx_tail_dma: Peri<'d, RxTailDma>,
         config: Config,
     ) -> Self {
-        Self::new_async_inner(
-            spi,
-            clk.into(),
-            None,
-            mosi.into(),
-            cs.into(),
-            tx_dma,
-            rx_dma,
-            tx_tail_dma,
-            rx_tail_dma,
-            config,
-        )
+        Self::new_async_inner(spi, clk.into(), None, mosi.into(), cs.into(), tx_dma, rx_dma, config)
     }
 
     fn new_async_inner<T: Instance>(
@@ -467,8 +427,6 @@ impl<'d> Spi<'d, Async> {
         cs: Peri<'d, AnyPin>,
         tx_dma: Peri<'d, impl ChannelInstance>,
         rx_dma: Peri<'d, impl ChannelInstance>,
-        padding_dma: Peri<'d, impl ChannelInstance>,
-        discard_dma: Peri<'d, impl ChannelInstance>,
         config: Config,
     ) -> Self {
         Self::new_inner(
@@ -480,20 +438,21 @@ impl<'d> Spi<'d, Async> {
             Some(DmaChannels {
                 tx: Channel::new_no_interrupt(tx_dma),
                 rx: Channel::new_no_interrupt(rx_dma),
-                padding: Channel::new_no_interrupt(padding_dma),
-                discard: Channel::new_no_interrupt(discard_dma),
             }),
             config,
         )
     }
 
     /// Sends data, discarding received data. Waits until CS rises.
+    /// Returns bytes queued to the TX FIFO, including bytes not clocked out before CS rose.
     /// See [`Self::transfer`] for DMA limits.
     pub async fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
-        self.transfer(&mut [], data).await.map(|(_, sent)| sent)
+        self.transfer(&mut [], data)
+            .await
+            .map(|(_, queued_for_tx)| queued_for_tx)
     }
 
-    /// Reads data, sending zeroes. Waits until CS rises.
+    /// Reads data without supplying TX bytes. MISO data is unspecified. Waits until CS rises.
     /// See [`Self::transfer`] for DMA limits.
     pub async fn read(&mut self, data: &mut [u8]) -> Result<usize, Error> {
         self.transfer(data, &[]).await.map(|(received, _)| received)
@@ -503,22 +462,18 @@ impl<'d> Spi<'d, Async> {
     /// Preloads TX; see [`Spi`] for master timing requirements.
     ///
     /// Short transactions leave the unused portion of RX unchanged.
-    /// Returns `(received, sent)` counts, capped at the respective buffer lengths.
+    /// Returns `(received, queued_for_tx)`, capped at the respective buffer lengths.
+    /// `queued_for_tx` counts bytes written to the TX FIFO, including bytes still in
+    /// the FIFO when CS rises. It does not report how many bytes reached the wire.
     /// Both counts can be full while the operation continues waiting for CS to rise.
-    /// Each DMA buffer is limited to the chip's DMA transfer count maximum
-    /// (`u32::MAX` bytes on RP2040, `0x0fff_ffff` bytes on RP235x). After the buffers
-    /// end, DMA can pad TX and discard RX for up to that many bytes each.
-    /// Exhausting either tail returns `TransactionTooLong`; RX FIFO overrun returns
-    /// `ReceiveOverrun`. All buffers stay borrowed until DMA has stopped.
+    /// Each DMA buffer is limited to `0x0fff_ffff` bytes.
+    /// RX FIFO overrun is ignored; TX data after the buffer ends is unspecified.
+    /// All buffers stay borrowed until DMA has stopped.
     pub async fn transfer(&mut self, rx: &mut [u8], tx: &[u8]) -> Result<(usize, usize), Error> {
         // Reject buffers whose lengths cannot be represented by DMA.
         if rx.len() > DMA_MAX_COUNT || tx.len() > DMA_MAX_COUNT {
             return Err(Error::BufferTooLong);
         }
-
-        // Each transfer owns its scratch byte, including when both SPI peripherals run.
-        // Declare it before cleanup so DMA stops before its storage is released.
-        let mut discard_byte = 0;
 
         let cs_pin = self.cs._pin() as usize;
         let cs_gpio = self.cs.gpio();
@@ -548,41 +503,33 @@ impl<'d> Spi<'d, Async> {
 
             // SAFETY: Channels are owned and idle, and buffer lengths were checked above.
             // The cleanup guard stops DMA before any buffer borrow is released.
-            unsafe { Self::configure_transfer_dma(info, dma, rx, tx, &mut discard_byte) };
+            unsafe { Self::configure_transfer_dma(info, dma, rx, tx) };
 
             // Publish buffer contents before any DMA channel starts.
             compiler_fence(Ordering::SeqCst);
 
-            // Start RX before TX so incoming bytes cannot be lost during setup.
-            pac::DMA.multi_chan_trigger().write(|w| {
-                w.set_multi_chan_trigger(
-                    1 << if rx.is_empty() {
-                        dma.discard.number()
-                    } else {
-                        dma.rx.number()
-                    },
-                );
-            });
+            // Start only nonempty buffers. No DMA runs after a buffer is exhausted.
+            if !rx.is_empty() {
+                pac::DMA
+                    .multi_chan_trigger()
+                    .write(|w| w.set_multi_chan_trigger(1 << dma.rx.number()));
+            }
 
-            // Enable only after DMA is configured and RX is armed.
             info.regs.cr1().modify(|w| w.set_sse(true));
 
-            // Start TX preload, using padding directly when the TX buffer is empty.
-            pac::DMA.multi_chan_trigger().write(|w| {
-                w.set_multi_chan_trigger(
-                    1 << if tx.is_empty() {
-                        dma.padding.number()
-                    } else {
-                        dma.tx.number()
-                    },
-                );
-            });
+            if !tx.is_empty() {
+                pac::DMA
+                    .multi_chan_trigger()
+                    .write(|w| w.set_multi_chan_trigger(1 << dma.tx.number()));
+            }
 
             // Keep preload cancellable and register the CS waker during setup.
             poll_fn(|cx| {
                 // Observe preload first, then validate CS so activity during this poll
                 // cannot be accepted just because the FIFO became full afterward.
-                let preloaded = !info.regs.sr().read().tnf();
+                let preloaded = tx.is_empty()
+                    || !info.regs.sr().read().tnf()
+                    || !pac::DMA.ch(dma.tx.number() as _).ctrl_trig().read().busy();
 
                 // Reject a transaction that starts before preload is complete.
                 if cs_end.as_mut().poll(cx).is_ready()
@@ -597,7 +544,7 @@ impl<'d> Spi<'d, Async> {
                     return Poll::Ready(Err(Error::DmaError));
                 }
 
-                // A full TX FIFO is ready for the next CS assertion.
+                // Ready when TX is empty, the FIFO is full, or all TX bytes are queued.
                 if preloaded {
                     return Poll::Ready(Ok(()));
                 }
@@ -613,53 +560,19 @@ impl<'d> Spi<'d, Async> {
         }
 
         // Stop DMA and retire pending writes before accessing RX.
-        let completed_channels = Self::stop_dma(info, dma);
+        Self::stop_dma(info, dma);
         cleanup.defuse();
 
-        self.finish_dma_transfer(rx, tx.len(), dma, completed_channels)
+        self.finish_dma_transfer(rx, tx.len(), dma)
     }
 
-    /// Configures the buffer channels and their padding/discard tails without starting DMA.
+    /// Configures the buffer channels without starting DMA.
     ///
     /// # Safety
     /// Channels must be owned and idle, and buffer lengths must fit `DMA_MAX_COUNT`.
-    /// Buffers and the scratch byte must remain borrowed
-    /// and at stable addresses until DMA has stopped.
-    unsafe fn configure_transfer_dma(
-        info: &Info,
-        dma: &DmaChannels<'_>,
-        rx: &mut [u8],
-        tx: &[u8],
-        discard_byte: &mut u8,
-    ) {
-        // static mut so that this is allocated in RAM; only read by DMA.
-        static mut PADDING_BYTE: u8 = 0;
-
-        // Discard excess RX into one byte without advancing the destination.
-        Self::configure_dma(
-            dma.discard.number(),
-            info.regs.dr().as_ptr() as _,
-            discard_byte,
-            DMA_MAX_COUNT,
-            false,
-            false,
-            info.rx_dreq,
-            dma.discard.number(),
-        );
-
-        // Repeatedly send the same zero byte after the TX buffer ends.
-        Self::configure_dma(
-            dma.padding.number(),
-            core::ptr::addr_of_mut!(PADDING_BYTE) as *const u8,
-            info.regs.dr().as_ptr() as _,
-            DMA_MAX_COUNT,
-            false,
-            false,
-            info.tx_dreq,
-            dma.padding.number(),
-        );
-
-        // Store RX in the buffer, then discard excess bytes.
+    /// Buffers must remain borrowed and at stable addresses until DMA has stopped.
+    unsafe fn configure_transfer_dma(info: &Info, dma: &DmaChannels<'_>, rx: &mut [u8], tx: &[u8]) {
+        // Store RX until the buffer fills, then allow the FIFO to overflow.
         if !rx.is_empty() {
             Self::configure_dma(
                 dma.rx.number(),
@@ -669,11 +582,11 @@ impl<'d> Spi<'d, Async> {
                 false,
                 true,
                 info.rx_dreq,
-                dma.discard.number(),
+                dma.rx.number(),
             );
         }
 
-        // Send the TX buffer once, then chain to zero padding.
+        // Send TX once, then allow the FIFO to underflow.
         if !tx.is_empty() {
             Self::configure_dma(
                 dma.tx.number(),
@@ -683,19 +596,18 @@ impl<'d> Spi<'d, Async> {
                 true,
                 false,
                 info.tx_dreq,
-                dma.padding.number(),
+                dma.tx.number(),
             );
         }
     }
 
-    /// Stores residual RX, checks DMA and SPI errors and clears transaction state.
+    /// Stores residual RX, checks DMA errors and clears transaction state.
     /// SPI and all DMA channels must be stopped before calling.
     fn finish_dma_transfer(
         &self,
         rx: &mut [u8],
         tx_len: usize,
         dma: &DmaChannels<'_>,
-        completed_channels: u32,
     ) -> Result<(usize, usize), Error> {
         // Check bus errors before using the DMA destination address.
         if dma.has_error() {
@@ -711,23 +623,23 @@ impl<'d> Spi<'d, Async> {
             let addr = pac::DMA.ch(dma.rx.number() as _).write_addr().read();
             (addr.wrapping_sub(rx.as_ptr() as u32) as usize).min(rx.len())
         };
-        // The discard channel is configured for every operation, even with empty RX.
-        // Count completed exchanges using RX, since TX DMA also counts FIFO preload.
-        let discard = pac::DMA.ch(dma.discard.number() as _).trans_count().read();
-        #[cfg(feature = "rp2040")]
-        let discard_remaining = discard as usize;
-        #[cfg(feature = "_rp235x")]
-        let discard_remaining = discard.count() as usize;
-        let exchanged = next.saturating_add(DMA_MAX_COUNT - discard_remaining);
-        let drained = self.finish_transfer(&mut rx[next..].iter_mut())?;
-        let exchanged = exchanged.saturating_add(drained);
+        // TX DMA counts bytes queued to the FIFO, not bytes clocked onto the wire.
+        // Empty TX leaves the channel unused, so its stale count must not be read.
+        let queued_for_tx = if tx_len == 0 {
+            0
+        } else {
+            let remaining = pac::DMA.ch(dma.tx.number() as _).trans_count().read();
+            #[cfg(feature = "rp2040")]
+            let remaining = remaining as usize;
+            #[cfg(feature = "_rp235x")]
+            let remaining = remaining.count() as usize;
+            tx_len.saturating_sub(remaining)
+        };
 
-        // Both tails are finite DMA jobs; completion means their capacity was exhausted.
-        if completed_channels & dma.tail_mask() != 0 {
-            return Err(Error::TransactionTooLong);
-        }
-
-        Ok((exchanged.min(rx.len()), exchanged.min(tx_len)))
+        let drained = self.drain_received(&mut rx[next..].iter_mut());
+        // Overflow is expected once RX is full. Clear it without returning an error.
+        Self::disable_and_clear_fifos(self.info);
+        Ok(((next + drained).min(rx.len()), queued_for_tx))
     }
 
     /// Configures a byte-wide DMA channel without triggering it.
@@ -761,7 +673,7 @@ impl<'d> Spi<'d, Async> {
             w.set_count(len as u32);
         });
 
-        // Use a non-triggering alias so tails can be configured before buffer channels.
+        // Configure without triggering the channel.
         p.al1_ctrl().write(|ctrl| {
             ctrl.set_data_size(pac::dma::vals::DataSize::SizeByte);
             ctrl.set_incr_read(incr_read);
@@ -806,13 +718,13 @@ impl<'d> Spi<'d, Async> {
         }
     }
 
-    /// Stops SPI and DMA, waits for pending writes and returns the pre-abort completion mask.
-    fn stop_dma(info: &Info, dma: &DmaChannels<'_>) -> u32 {
+    /// Stops SPI and DMA and waits for pending writes.
+    fn stop_dma(info: &Info, dma: &DmaChannels<'_>) {
         // Stop SPI before disabling the DMA channels servicing its FIFOs.
         info.regs.cr1().modify(|w| w.set_sse(false));
 
         let mask = dma.mask();
-        // Disable all channels before abort to prevent tail retriggering (RP2350-E5).
+        // Disable all channels before abort (RP2350-E5).
         for channel in dma.numbers() {
             pac::DMA.ch(channel as _).ctrl_trig().write_clear(|w| w.set_en(true));
         }
@@ -827,9 +739,6 @@ impl<'d> Spi<'d, Async> {
                 w.set_write_error(false);
             });
         }
-
-        // Capture genuine completion before abort can assert it (RP2040-E13).
-        let completed_channels = pac::DMA.intr(0).read() & mask;
 
         // Abort all owned channels and wait for the requests to clear.
         pac::DMA.chan_abort().write(|w| w.set_chan_abort(mask as _));
@@ -847,8 +756,6 @@ impl<'d> Spi<'d, Async> {
 
         // RP2040-E13 may assert completion during abort.
         pac::DMA.intr(0).write_value(mask);
-
-        completed_channels
     }
 }
 
